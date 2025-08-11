@@ -1,0 +1,132 @@
+---
+title: "Midterm Project - Data Cleaning"
+author: "Shreeya Sampat"
+format: docx
+editor: visual
+---
+
+# Data Exploration Project:
+
+In this project I will be compiling together some messy real-world data, and then designing an analysis to answer a research question.
+
+### Research Question:
+
+The College Scorecard was released at the start of September 2015. **Among colleges that predominantly grant bachelor’s degrees**, did the release of the Scorecard shift student interest to high-earnings colleges relative to low-earnings ones (as proxied by Google searches for keywords associated with those colleges)?
+
+### The Data:
+
+The ZIP file `Data_Exploration_Rawdata.zip` contains a number of files:
+
+-   `trends_up_to_....csv`: These are files generated using Google Trends. They are the Google Trends index for each `keyword` for the given `monthorweek`. Each `keyword` (indexed with `keynum`) is selected to be reflective of a university in the United States, given by `schname`. There are multiple files because the Google Trends API will kick you off if you make too many requests, and you have to start again.
+
+-   `Most+Recent+Cohorts+(Scorecard+Elements).csv`: This is data from the College Scorecard, a simple dataset that contains lots of information about United States colleges and the students that graduate from them. The variable names aren’t super helpful but they are documented in `CollegeScorecardDataDictionary-09-08-2015.csv`
+
+-   `id_name_link.csv`, which can be used to match colleges as identified in the Scorecard data (by `unitid` and `opeid` / `UNITID` and `OPEID`) with colleges as identified in the Google Trends data (by `schname`). The `join` functions will be helpful (see `help(join)` after loading the **tidyverse**)
+
+```{r}
+# Load necessary libraries
+library(rio)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(fixest)
+library(broom)
+```
+
+\# Load necessary libraries
+
+library(rio)
+
+library(dplyr)
+
+library(lubridate)
+
+library(stringr)
+
+library(ggplot2)
+
+library(fixest)
+
+library(broom)
+
+```{r}
+# Use list.files(), probably with the full.names = TRUE option, to create a vector of filenames of all the trends_up_to_ files are
+# Get all filenames for the Google Trends data
+trend_files <- list.files(
+  # Folder where your files are
+  path = "Lab3_Rawdata",
+  # Matches all Google Trends files
+  pattern = "^trends_up_to_.*\\.csv$",        
+  full.names = TRUE                           
+)
+
+# Then, use import_list() in the rio package to read in that vector of filenames, using rbind = TRUE to bind all the results together into a single dataset
+# Import all trends CSVs into a single dataset
+trends_raw <- import_list(trend_files, rbind = TRUE)
+
+# Quick check
+glimpse(trends_raw)
+```
+
+```{r}
+# Aggregating the Google Trends data
+
+# You're probably going to want to get an actual date variable to do aggregation and modeling. monthorweek is a string
+
+# Extract Start of Week and Convert to Date
+# Use str_sub to get the first ten characters out of the monthorweek variable
+# Then, load the lubridate package and use the ymd() function to turn that into an actual usable date
+trends_clean <- trends_raw %>%
+  mutate(
+    week = str_sub(monthorweek, 1, 10), 
+    week = ymd(week)                  
+  )
+
+# If you want to aggregate the dates further, say to do months rather than weeks, you can use the floor_date() function from lubridate. Setting the units to 'month', for example, will "round down" all dates in the same month to be the first of the month
+trends_clean <- trends_clean %>%
+  mutate(month = floor_date(week, unit = "month"))
+
+glimpse(trends_clean)
+```
+
+```{r}
+# Aggregating
+
+# We can't aggregate the index variable as-is since they're all on different scales
+# Use group_by() and mutate() to standardize the index variable by school name and keyword (subtract the mean of index and then divide the result by the standard deviation of index, calculating both of those within school name and keyword)
+
+# Standardize the Index by schname and keynum
+trends_standardized <- trends_clean %>%
+  mutate(schname = stringr::str_squish(stringr::str_to_lower(schname))) %>%
+  filter(
+    !is.na(schname), schname != "",
+    !is.na(month),
+    !is.na(index),
+    index >= 0, index <= 100
+  ) %>%
+  group_by(keynum) %>%
+  mutate(
+    index_std = as.numeric(scale(index)),         
+    index_std = ifelse(is.na(index_std), 0, index_std)
+  )
+
+# Now, a one-unit change in the standardized index can be understood and interpreted as a one-standard-deviation change in search interest
+  
+# Now, if you want, you can use group_by() and summarize() to aggregate your standardized index to the keyword-month level, or school-week level, or school-month level, or whatever you want
+
+# Aggregate to college-month
+trends_agg <- trends_standardized %>%
+  group_by(schname, month) %>%
+  summarise(
+    avg_std_index = mean(index_std, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+glimpse(trends_agg)
+```
+
+```{r}
+rio::export(trends_agg, "clean_trends_month_school.rds")
+cat("Saved cleaned file as clean_trends_month_school.rds\n")
+```
