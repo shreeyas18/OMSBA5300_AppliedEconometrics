@@ -1,0 +1,508 @@
+---
+title: "Midterm Project - Data Analysis"
+author: "Shreeya Sampat"
+format: docx
+editor: visual
+---
+
+```{r}
+# Load necessary libraries
+library(rio)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(fixest)
+library(broom)
+library(forcats)
+
+```
+
+```{r}
+# Load cleaned data from the first QMD output
+trends_agg <- rio::import("clean_trends_month_school.rds")%>%
+  dplyr::mutate(schname = stringr::str_squish(stringr::str_to_lower(schname)))
+```
+
+```{r}
+# Reading in the Scorecard data
+
+# You can just use import() to read in the Scorecard data ('Most+Recent+Cohorts+(Scorecard+Elements)'). The dictionary file you can also read in if you like, although you're probably just better off opening that in Excel to read it - you're going to use that to figure out what all the variables are but you're not going to use the dictionary in analysis.
+# You can also use import() to read in the id_name_link file.
+
+# Read in the Scorecard Data
+scorecard <- import("Lab3_Rawdata/Most+Recent+Cohorts+(Scorecard+Elements).csv")
+
+# Read in the id_name_link.csv File
+id_link <- import("Lab3_Rawdata/id_name_link.csv")
+
+glimpse(id_link)
+```
+
+```{r}
+# Merge in the Scorecard data
+
+# Normalize keys on the Trends side
+trends_agg <- trends_agg %>%
+  dplyr::mutate(schname = stringr::str_squish(stringr::str_to_lower(schname)))
+
+# First, use group_by() and mutate(n = n()) to count how many times each school name pops up in id_name_link,
+# and then filter to get rid of any school names that show up more than once
+id_link_clean <- id_link %>%
+  dplyr::mutate(schname = stringr::str_squish(stringr::str_to_lower(schname))) %>%
+  dplyr::group_by(schname) %>%
+  dplyr::filter(dplyr::n_distinct(unitid) == 1) %>%
+  dplyr::distinct(schname, unitid, .keep_all = FALSE) %>%
+  dplyr::ungroup()
+
+# Prep Scorecard 
+# Keep bachelor focused and only needed columns
+# If the earnings column name differs, use grep to locate it
+earn_col <- grep("md_earn.*p10|earn.*p10", names(scorecard),
+                 ignore.case = TRUE, value = TRUE)[1]
+
+scorecard_clean <- scorecard %>%
+  dplyr::mutate(
+    UNITID  = as.integer(UNITID),
+    PREDDEG = suppressWarnings(as.numeric(PREDDEG))
+  ) %>%
+  dplyr::filter(PREDDEG == 3) %>%                         # BA-focused
+  dplyr::distinct(UNITID, .keep_all = TRUE) %>%
+  dplyr::select(UNITID, INSTNM, PREDDEG, dplyr::all_of(earn_col)) %>%
+  dplyr::mutate(earnings_num = suppressWarnings(as.numeric(.data[[earn_col]])))
+
+# Global median cutoff (this is what defines high vs. low)
+median_cutoff <- median(scorecard_clean$earnings_num, na.rm = TRUE)
+cat("Global median 10-year earnings cutoff: $", round(median_cutoff, 0), "\n", sep = "")
+
+# Histogram with median label moved to whitespace
+ggplot(scorecard_clean, aes(x = earnings_num)) +
+  geom_histogram(fill = "steelblue", color = "white", bins = 30) +
+  geom_vline(xintercept = median_cutoff, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text",
+           x = median_cutoff + 20000,
+           y = max(table(cut(scorecard_clean$earnings_num, breaks = 30))) + 10,
+           label = paste0("Median = $", format(round(median_cutoff, 0), big.mark = ",")),
+           color = "red", size = 4, fontface = "bold") +
+  labs(title = "Distribution of Median Earnings (10 Years After Entry)",
+       x = "Median Earnings (USD)", y = "Number of Colleges") +
+  theme_minimal()
+
+# Join Trends to id link, then to Scorecard
+# (inner_join will drop any rows that don't find a match, which is fine for this project. The other _join functions behave differently about non-matches)
+trends_with_unitid <- trends_agg %>%
+  dplyr::inner_join(id_link_clean, by = "schname")
+
+full_data <- trends_with_unitid %>%
+  dplyr::inner_join(scorecard_clean, by = c("unitid" = "UNITID")) %>%
+  dplyr::mutate(earnings = suppressWarnings(as.numeric(.data[[earn_col]]))) %>%
+  dplyr::filter(!is.na(earnings)) %>%
+  dplyr::mutate(
+    high_earning   = dplyr::if_else(earnings >= median_cutoff, 1L, 0L),
+    post_scorecard = dplyr::if_else(month >= as.Date("2015-09-01"), 1L, 0L)
+  )
+
+# Quick check
+cat("Rows after join to id link:", nrow(trends_with_unitid), "\n")
+cat("Rows after join to scorecard:", nrow(full_data), "\n")
+glimpse(full_data)
+```
+
+```{r}
+# Build clean analysis set
+clean_data <- full_data %>%
+  filter(!is.na(avg_std_index)) %>%
+  group_by(schname) %>%
+  mutate(
+    pre_score  = sum(post_scorecard == 0, na.rm = TRUE),
+    post_score = sum(post_scorecard == 1, na.rm = TRUE)
+  ) %>%
+  # keep schools with at least six months pre score and six months post score
+  filter(pre_score >= 6, post_score >= 6) %>%
+  ungroup() %>%
+  select(schname, month, avg_std_index, high_earning, post_scorecard)
+```
+
+```{r}
+# Two way fixed effects DID
+did_mod <- feols(
+  avg_std_index ~ post_scorecard * high_earning | schname + month,
+  cluster = ~ schname,
+  data = clean_data
+)
+
+summary(did_mod)
+```
+
+```{r}
+att <- tidy(did_mod) %>%
+  filter(term == "post_scorecard:high_earning") %>%
+  transmute(
+    direction = ifelse(estimate > 0, "increased", "decreased"),
+    estimate = round(estimate, 3),
+    se = round(std.error, 3)
+  )
+
+cat("The introduction of the College Scorecard", att$direction,"search activity on Google Trends for colleges with high-earning graduates by",att$estimate, "standard deviations relative to what it did for colleges with low-earning graduates,","with a standard error of", att$se,". This result comes from the post_scorecard × high_earning coefficient in my regression.")
+```
+
+```{r}
+# Visualizations
+# Visualize Search Interest Over Time by Earning Group
+ggplot(clean_data, aes(x = month, y = avg_std_index, color = factor(high_earning))) +
+  stat_summary(fun = mean, geom = "line", size = 1) +
+  geom_vline(xintercept = as.Date("2015-09-01"), linetype = "dashed") +
+  labs(
+    title = "Average Standardized Search Interest by Earnings Group",
+    subtitle = "Vertical line marks College Scorecard release in September 2015",
+    x = "Month",
+    y = "Standard Deviations",
+    color = "High Earning"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Continuous earnings interaction
+earnings_scaled <- scale(full_data$earnings)
+cd_cont <- clean_data %>%
+  left_join(
+    full_data %>% select(schname, month, earnings) %>% mutate(ez = as.numeric(scale(earnings))),
+    by = c("schname","month"))
+
+did_cont <- feols(
+  avg_std_index ~ post_scorecard * ez | schname + month,
+  cluster = ~ schname,
+  data = cd_cont
+)
+summary(did_cont)
+```
+
+```{r}
+# Quartiles of earnings instead of median split
+q <- quantile(full_data$earnings, probs = c(.25, .5, .75), na.rm = TRUE)
+cd_q <- full_data %>%
+  mutate(
+    earn_q = cut(earnings, breaks = c(-Inf, q[1], q[2], q[3], Inf), labels = c("Q1","Q2","Q3","Q4"))
+  ) %>%
+  semi_join(clean_data %>% distinct(schname, month), by = c("schname","month"))
+
+did_q <- feols(
+  avg_std_index ~ post_scorecard * i(earn_q, ref = "Q1") | schname + month,
+  cluster = ~ schname,
+  data = cd_q
+)
+etable(did_q)
+```
+
+```{r}
+clean_data <- clean_data %>%
+  mutate(
+    month_num  = month(month),                                   
+    time_index = as.integer(interval(min(month), month) %/% months(1))
+  )
+
+# Model A: Basic DID
+model_a <- feols(
+  avg_std_index ~ post_scorecard * high_earning,
+  data = clean_data,
+  cluster = ~ schname
+)
+
+# Model B: DID + Seasonality
+# i(month_num) adds 11 month indicators and leaves one out as reference
+model_b <- feols(
+  avg_std_index ~ post_scorecard * high_earning + i(month_num),
+  data = clean_data,
+  cluster = ~ schname
+)
+
+# Model C: DID + Seasonality + School Fixed Effects
+model_c <- feols(
+  avg_std_index ~ post_scorecard * high_earning + i(month_num) | schname,
+  data = clean_data,
+  cluster = ~ schname
+)
+
+# Model D: Model C + Time Trend
+# This is the canonical two way fixed effects model for DID
+# Do not also include time_index with month FE to avoid collinearity
+model_d <- feols(
+  avg_std_index ~ post_scorecard * high_earning | schname + month,
+  data = clean_data,
+  cluster = ~ schname
+)
+
+# Model E: Linear Time Trend
+model_e <- feols(
+  avg_std_index ~ post_scorecard * high_earning + time_index | schname,
+  data = clean_data,
+  cluster = ~ schname
+)
+
+# Comparison table
+etable(
+  list(
+    "Basic DID" = model_a,
+    "Seasonality" = model_b,
+    "FE School plus Seasonality" = model_c,
+    "Two Way FE" = model_d,
+    "Linear Time Trend" = model_e
+  ),
+  dict = c(
+    "post_scorecard" = "Post Scorecard",
+    "high_earning" = "High Earning",
+    "post_scorecard:high_earning" = "DID Interaction",
+    "i(month_num, ..1)" = "Month Dummies"
+  ),
+  se = "cluster",
+  cluster = ~ schname,
+  fitstat = ~ r2 + ar2 + n
+)
+
+# Tidy pull of the DID interaction from each model
+grab_att <- function(mod) {
+  out <- broom::tidy(mod)
+  row <- dplyr::filter(out,
+                       term %in% c("post_scorecard:high_earning",
+                                   "post_scorecard x high_earning"))
+  if (nrow(row) == 0) {
+    tibble::tibble(estimate = NA_real_, se = NA_real_)
+  } else {
+    tibble::tibble(estimate = row$estimate[1], se = row$std.error[1])
+  }
+}
+
+att_tbl <- tibble::tibble(
+  model = c("A) Basic",
+            "B) Seasonality",
+            "C) FE School plus Seasonality",
+            "D) Two Way FE",
+            "E) Linear Time Trend")
+) |>
+  dplyr::bind_cols(dplyr::bind_rows(
+    grab_att(model_a),
+    grab_att(model_b),
+    grab_att(model_c),
+    grab_att(model_d),
+    grab_att(model_e)
+  )) |>
+  dplyr::mutate(
+    estimate = round(estimate, 3),
+    se       = round(se, 3)
+  )
+
+print(att_tbl)
+
+model_sentence <- function(name, est, se) {
+  direction <- ifelse(est > 0, "increased", "decreased")
+  est_abs   <- abs(est)
+  paste0(
+    name, ": The introduction of the College Scorecard ", direction,
+    " search activity on Google Trends for colleges with high earning graduates by ",
+    formatC(est_abs, digits = 3, format = "f"), " standard deviations relative to what it did for colleges with low earning graduates, ",
+    "with a standard error of ", formatC(se, digits = 3, format = "f"),
+    ". This result comes from the post_scorecard times high_earning coefficient in my regression."
+  )
+}
+
+cat(
+  paste0(
+    apply(att_tbl, 1, function(r) model_sentence(
+      r[["model"]], as.numeric(r[["estimate"]]), as.numeric(r[["se"]])
+    )),
+    collapse = "\n\n"
+  ),
+  "\n\n"
+)
+
+cat(
+  "Note: Linear Time Trend in Model E specification replaces month fixed effects with a linear time trend while keeping school fixed effects. The DID interaction is nearly identical to the two way fixed effects estimate, which supports validity of alternative time controls.\n\n"
+)
+
+att_d <- dplyr::filter(att_tbl, model == "D) Two Way FE")
+cat(
+  "Preferred specification: The introduction of the College Scorecard ",
+  ifelse(att_d$estimate > 0, "increased", "decreased"), " search activity on Google Trends for colleges with high earning graduates by ",
+  formatC(abs(att_d$estimate), digits = 3, format = "f"),
+  " standard deviations relative to low earning colleges, with a standard error of ",
+  formatC(att_d$se, digits = 3, format = "f"),
+  ". This result comes from the post_scorecard times high_earning coefficient in the two way fixed effects model with school and month fixed effects.\n",
+  sep = ""
+)
+```
+
+```{r}
+# Build the comparison data
+get_att <- function(mod, label) {
+  tidy(mod) |>
+    filter(term %in% c("post_scorecard:high_earning",
+                       "post_scorecard x high_earning")) |>
+    transmute(model = label, estimate, se = std.error)
+}
+
+att_compare <- bind_rows(
+  get_att(model_a, "A) Basic"),
+  get_att(model_b, "B) Seasonality"),
+  get_att(model_c, "C) FE School plus Seasonality"),
+  get_att(model_d, "D) Two Way FE"),
+  get_att(model_e, "E) Linear Time Trend")
+) |>
+  mutate(
+    lo   = estimate - 1.96 * se,
+    hi   = estimate + 1.96 * se,
+    label = sprintf("%.3f", estimate),
+    model = fct_rev(factor(
+      model,
+      levels = c("A) Basic","B) Seasonality","C) FE School plus Seasonality",
+                 "D) Two Way FE","E) Linear Time Trend")
+    )),
+    highlight = (model == "D) Two Way FE")
+  )
+
+# Plot with numbers, no zoom, highlight Model D
+model_compare <- ggplot(att_compare, aes(x = estimate, y = model)) +
+  geom_errorbarh(aes(xmin = lo, xmax = hi, color = highlight), height = 0.15, size = 1) +
+  geom_point(aes(color = highlight), size = 3) +
+  geom_text(aes(label = label), vjust = -1, nudge_x = 0.002, size = 3.6, color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c(`TRUE` = "red", `FALSE` = "grey60"), guide = "none") +
+  labs(
+    title = "Comparison of DID Estimates Across Models",
+    subtitle = "Points are coefficients for 'post_scorecard × high_earning' \nwith 95% confidence intervals",
+    x = "DID Interaction Coefficient",
+    y = "Model"
+  ) +
+  theme_minimal(base_size = 13)
+
+model_compare
+```
+
+```{r}
+
+avg_pre_post <- clean_data %>%
+  mutate(period = ifelse(post_scorecard == 1, "Post", "Pre"),
+         period = factor(period, levels = c("Pre", "Post"))) %>%
+  group_by(high_earning, period) %>%
+  summarise(mean_index = mean(avg_std_index, na.rm = TRUE)) %>%
+  mutate(high_earning = ifelse(high_earning == 1, "High Earning", "Low Earning"))
+
+ggplot(avg_pre_post, aes(x = period, y = mean_index, fill = high_earning)) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_text(
+    aes(label = round(mean_index, 3)),
+    position = position_dodge(width = 0.9),
+    vjust = ifelse(avg_pre_post$mean_index >= 0, -0.3, 1.2),
+    size = 3.5
+  ) +
+  labs(
+    title = "Average Search Activity Pre vs. Post College Scorecard",
+    y = "Average Search Activity (Std Index)",
+    x = "Period",
+    fill = "College Group"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Create relative time variable in months from Scorecard launch
+clean_data <- clean_data %>%
+  mutate(
+    rel_month = as.integer(difftime(month, as.Date("2015-09-01"), units = "days") / 30)
+  )
+
+# Create event-time dummies (exclude -1 as the reference period)
+event_study <- feols(
+  avg_std_index ~ i(rel_month, high_earning, ref = -1) | schname + month,
+  data = clean_data,
+  cluster = ~schname
+)
+
+# Plot event-study coefficients
+iplot(event_study, main = "Event-Study: Pre and Post Trends",
+      xlab = "Months Relative to Scorecard Launch", ylab = "Coefficient",
+      col = "steelblue")
+```
+
+```{r}
+# Create placebo treatment indicator (pretend launch = Sept 2014)
+full_data <- full_data %>%
+  mutate(
+    post_scorecard_placebo = if_else(month >= as.Date("2014-09-01"), 1L, 0L)
+  )
+
+# Run placebo DID using your preferred model (Two-Way FE as example)
+placebo_model <- feols(
+  avg_std_index ~ post_scorecard_placebo * high_earning | schname + month,
+  data = full_data
+)
+
+# Extract coefficient and CI
+placebo_tidy <- tidy(placebo_model, conf.int = TRUE) %>%
+  filter(term == "post_scorecard_placebo:high_earning")
+
+# Plot placebo effect
+ggplot(placebo_tidy, aes(x = estimate, y = 1)) +
+  geom_point(color = "red", size = 3) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, color = "red") +
+  geom_text(aes(label = sprintf("%.3f", estimate)), 
+            vjust = -1.2, color = "black", size = 4, fontface = "bold") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_y_continuous(breaks = NULL) +
+  labs(
+    title = "Placebo DID Estimate (Pretend Scorecard Launch = Sept 2014)",
+    x = "DID Interaction Coefficient",
+    y = NULL,
+    caption = "If this is significant, the original effect may be due to pre-existing trends."
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Compare Model D (real Scorecard date) vs Placebo (Sept 2014)
+
+# Pull the interaction term + 95% CI from each model
+did_d <- broom::tidy(model_d, conf.int = TRUE) %>%
+  dplyr::filter(term %in% c("post_scorecard:high_earning",
+                            "post_scorecard x high_earning")) %>%
+  dplyr::transmute(
+    what = "Model D: Two-Way FE",
+    estimate, conf.low, conf.high
+  )
+
+did_p <- broom::tidy(placebo_model, conf.int = TRUE) %>%
+  dplyr::filter(term %in% c("post_scorecard_placebo:high_earning",
+                            "post_scorecard_placebo x high_earning")) %>%
+  dplyr::transmute(
+    what = "Placebo (Launch = Sept 2014)",
+    estimate, conf.low, conf.high
+  )
+
+compare_df <- dplyr::bind_rows(did_d, did_p) %>%
+  dplyr::mutate(
+    what  = factor(what, levels = c("Model D: Two-Way FE",
+                                    "Placebo (Launch = Sept 2014)")),
+    label = sprintf("%.3f", estimate)
+  )
+
+# Plot
+ggplot(compare_df, aes(x = estimate, y = what, color = what)) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.15, size = 1) +
+  geom_point(size = 3) +
+  geom_text(aes(label = label), vjust = -1, nudge_x = 0.001, size = 3.8,
+            color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Model D: Two-Way FE" = "#1f78b4",
+                                "Placebo (Launch = Sept 2014)" = "#e31a1c"),
+                     guide = "none") +
+  labs(
+    title = "DID vs. Placebo DID",
+    subtitle = "Interaction coefficients for high × post\nwith 95% confidence intervals",
+    x = "DID interaction coefficient",
+    y = NULL,
+    caption = "Model D uses school and month fixed effects. Placebo pretends the launch was Sept 2014."
+  ) +
+  theme_minimal(base_size = 13)
+```
